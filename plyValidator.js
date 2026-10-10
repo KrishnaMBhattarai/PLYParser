@@ -13,7 +13,7 @@ fs.readdir(directoryPath, (err, files) => {
   files.forEach((file) => {
     if (path.extname(file) === '.ply') {
       const filePath = path.join(directoryPath, file);
-      const data = fs.readFileSync(filePath, 'utf-8');
+      const data = fs.readFileSync(filePath);
       console.log(`File: ${file}`);
       const result = parsePlyData(data);
 
@@ -24,6 +24,7 @@ fs.readdir(directoryPath, (err, files) => {
       console.log(`Vertices Length = ${result.vertices.length}`);
       console.log(`Faces Length = ${result.faces.length}`);
       console.log(`Colors Length = ${result.colors.length}`);
+      console.log(`Normals Length = ${result.normals.length}`);
       console.log('\n');
     }
   });

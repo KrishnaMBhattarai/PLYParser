@@ -1,111 +1,212 @@
-function parsePlyData(data) {
-    const lines = data.split('\n');
+/**
+ * PLYParser - parses PLY (Polygon File Format) files.
+ *
+ *   parsePlyData(string | ArrayBuffer | Buffer | TypedArray) -> {
+ *     vertices: [[x, y, z], ...],
+ *     faces:    [[i0, i1, i2, ...], ...]   (polygons of any size, as stored in the file)
+ *     colors:   [[r, g, b], ...]           (raw values as stored, e.g. 0-255 for uchar; [] if none)
+ *     normals:  [[nx, ny, nz], ...]        ([] if none)
+ *   }
+ *
+ * Supports ascii, binary_little_endian and binary_big_endian files. The header drives parsing,
+ * so any vertex layout (extra properties, any order) and any extra elements are handled.
+ * Binary files must be passed as bytes (e.g. fs.readFileSync(path) without an encoding).
+ * Throws an Error with a readable message on malformed input.
+ */
+(function () {
+    // name -> { size, get: DataView getter, integer }
+    const TYPES = {};
+    for (const [names, size, get, integer] of [
+        [['char', 'int8'], 1, 'getInt8', true],
+        [['uchar', 'uint8'], 1, 'getUint8', true],
+        [['short', 'int16'], 2, 'getInt16', true],
+        [['ushort', 'uint16'], 2, 'getUint16', true],
+        [['int', 'int32'], 4, 'getInt32', true],
+        [['uint', 'uint32'], 4, 'getUint32', true],
+        [['float', 'float32'], 4, 'getFloat32', false],
+        [['double', 'float64'], 8, 'getFloat64', false],
+    ]) for (const n of names) TYPES[n] = {size, get, integer};
 
-    let expectedFaces = null;
-    let expectedVertices = null;
+    const NORMAL_NAMES = [['nx', 'ny', 'nz'], ['normal_x', 'normal_y', 'normal_z']];
+    const COLOR_NAMES = [['red', 'green', 'blue'], ['r', 'g', 'b'], ['diffuse_red', 'diffuse_green', 'diffuse_blue']];
+    const FACE_LIST_NAMES = ['vertex_indices', 'vertex_index'];
 
-    const vertices = [];
-    const faces = [];
-    const colors = [];
+    function parsePlyData(input) {
+        let bytes = null, text;
+        if (typeof input === 'string') text = input;
+        else if (input instanceof ArrayBuffer || ArrayBuffer.isView(input)) {
+            bytes = ArrayBuffer.isView(input)
+                ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+                : new Uint8Array(input);
+            text = new TextDecoder('latin1').decode(bytes); // one char per byte, so string offsets == byte offsets
+        } else throw new Error('PLY: input must be a string, Buffer or ArrayBuffer');
 
-    let vertexCount = 0;
-    let facesCount = 0;
+        const end = /^[ \t]*end_header[ \t]*(?:\r\n|\r|\n|$)/m.exec(text);
+        if (!end) throw new Error('PLY: missing "end_header" (not a PLY file?)');
+        const bodyStart = end.index + end[0].length;
+        const h = parseHeader(text.slice(0, end.index));
 
-    let property_red = 0
-    let property_blue = 0
-    let property_green = 0
+        let reader;
+        if (h.format === 'ascii') reader = asciiReader(text.slice(bodyStart));
+        else if (bytes) reader = binaryReader(bytes, bodyStart, h.format === 'binary_little_endian');
+        else throw new Error(`PLY: ${h.format} files must be passed as a Buffer/ArrayBuffer, not a string`);
 
-    for (let x = 0; x < lines.length; x++) {
-        const line = lines[x].trim();
-
-        if (!line || line === '') {
-            continue;
-        }
-
-        if (line.startsWith("format")) {
-            const fileFormat = line.trim().split(' ')[1];
-            if (fileFormat.toLowerCase() !== "ascii") {
-                console.log(`File format is not ascii! It is: ${fileFormat}`);
-                throw new Error(`File format is not ascii! It is: ${fileFormat}`);
-            }
-        }
-
-        if (line.startsWith("comment")) {
-            continue;
-        }
-
-        if (line.includes("element vertex")) {
-            expectedVertices = parseInt(line.match(/^element\s+vertex\s+(\d+)/)[1]);
-            continue
-        }
-
-        if (line.includes("property uchar red")) {
-            property_red = 1
-            continue
-        }
-        if (line.includes("property uchar green")) {
-            property_green = 1
-            continue
-        }
-        if (line.includes("property uchar blue")) {
-            property_blue = 1
-            continue
-        }
-        if (line.includes("element face")) {
-            expectedFaces = parseInt(line.match(/^element\s+face\s+(\d+)/)[1]);
-        }
-
-        if (line.includes("end_header")) {
-            continue;
-        }
-
-        if (line.match(/^([-|\d]+(\.\d+)?)\s+([-|\d]+(\.\d+)?)\s+([-|\d]+(\.\d+)?)/) && vertexCount !== expectedVertices) {
-            vertexCount += 1;
-
-            if ((property_red === 1) && (property_green === 1) && (property_blue === 1)) {
-                const vertex = line.trim().split(/\s+/).slice(0, 6)
-                vertices.push([parseFloat(vertex[0]), parseFloat(vertex[1]), parseFloat(vertex[2])]);
-                colors.push([parseFloat(vertex[3]), parseFloat(vertex[4]), parseFloat(vertex[5])]);
-
-            } else {
-                const vertex = line.trim().split(/\s+/).slice(0, 3)
-                vertices.push([parseFloat(vertex[0]), parseFloat(vertex[1]), parseFloat(vertex[2])]);
-            }
-
-        }
-
-        if (line.match(/^[34]\s+\d+\s+\d+\s\d+/) && facesCount !== expectedFaces) {
-            facesCount += 1;
-
-            if (line[0].startsWith('3')) {
-                const face = line.trim().split(/\s+/).slice(1, 4)
-                faces.push([parseInt(face[0]), parseInt(face[1]), parseInt(face[2])]);
-            } else if (line[0].startsWith('4')) {
-                const face = line.trim().split(/\s+/).slice(1, 5)
-                faces.push([parseInt(face[0]), parseInt(face[1]), parseInt(face[2]), parseInt(face[3])]);
-            }
-        }
+        return readBody(h, reader);
     }
 
-    if (vertices.length !== expectedVertices) {
-        console.log(`Error: total vertices read: ${vertices.length} does not match expected vertices: ${expectedVertices}`);
-        throw new Error(`Error: total vertices read: ${vertices.length} does not match expected vertices: ${expectedVertices}`);
+    function parseHeader(headerText) {
+        const lines = headerText.split(/\r\n|\r|\n/).map((l) => l.trim()).filter(Boolean);
+        if (!lines.length || lines[0].split(/\s+/)[0] !== 'ply') throw new Error('PLY: file does not start with "ply"');
+        let format = null, el = null;
+        const elements = [];
+
+        for (const line of lines.slice(1)) {
+            const tok = line.split(/\s+/);
+            if (tok[0] === 'format') {
+                format = tok[1];
+                if (!['ascii', 'binary_little_endian', 'binary_big_endian'].includes(format)) {
+                    throw new Error(`PLY: unsupported format "${format}"`);
+                }
+            } else if (tok[0] === 'element') {
+                const count = Number(tok[2]);
+                if (!tok[1] || !Number.isInteger(count) || count < 0) throw new Error(`PLY: bad element line "${line}"`);
+                elements.push((el = {name: tok[1], count, props: []}));
+            } else if (tok[0] === 'property') {
+                if (!el) throw new Error(`PLY: property before any element: "${line}"`);
+                const list = tok[1] === 'list';
+                const typeNames = list ? tok.slice(2, 4) : [tok[1]];
+                const name = tok[list ? 4 : 2];
+                if (!name) throw new Error(`PLY: bad property line "${line}"`);
+                for (const t of typeNames) if (!TYPES[t]) throw new Error(`PLY: unknown type "${t}"`);
+                if (list) {
+                    const countType = TYPES[typeNames[0]];
+                    if (!countType.integer) throw new Error(`PLY: list count type must be integer in "${line}"`);
+                    el.props.push({name, list, countType, itemType: TYPES[typeNames[1]]});
+                } else {
+                    el.props.push({name, list, type: TYPES[typeNames[0]]});
+                }
+            } // comments, obj_info and unknown keywords are ignored
+        }
+        if (!format) throw new Error('PLY: missing "format" line');
+
+        const vertexEl = elements.find((e) => e.name === 'vertex');
+        if (!vertexEl) throw new Error('PLY: no "vertex" element');
+        if (vertexEl.count > 0) {
+            for (const c of ['x', 'y', 'z']) {
+                const p = vertexEl.props.find((q) => q.name === c);
+                if (!p) throw new Error(`PLY: vertex element has no "${c}" property`);
+                if (p.list) throw new Error(`PLY: vertex property "${c}" must not be a list`);
+            }
+        }
+        const vnames = vertexEl.props.filter((p) => !p.list).map((p) => p.name);
+        const triple = (sets) => sets.find((s) => s.every((n) => vnames.includes(n))) || null;
+        const faceEl = elements.find((e) => e.name === 'face') || null;
+        const faceList = faceEl ? faceEl.props.find((p) => p.list && FACE_LIST_NAMES.includes(p.name)) || null : null;
+        if (faceEl && faceEl.count > 0 && !faceList) {
+            throw new Error('PLY: face element has no "vertex_indices" list property');
+        }
+
+        return {format, elements, vertexEl, faceList, normalNames: triple(NORMAL_NAMES), colorNames: triple(COLOR_NAMES)};
     }
 
-    if (faces.length !== expectedFaces) {
-        console.log(`Error: total faces read: ${faces.length} does not match expected faces: ${expectedFaces}`);
-        throw new Error(`Error: total faces read: ${faces.length} does not match expected faces: ${expectedFaces}`);
+    /** Whitespace-separated tokens (any line endings). */
+    function asciiReader(body) {
+        body = body.trim();
+        const toks = body ? body.split(/\s+/) : [];
+        let i = 0;
+        return {
+            num() {
+                if (i >= toks.length) throw new Error('unexpected end of file');
+                const s = toks[i++], v = +s;
+                if (v !== v && !/^[+-]?nan$/i.test(s)) throw new Error(`invalid number "${s.slice(0, 40)}"`);
+                return v;
+            },
+            skip(type, count) {
+                if ((i += count) > toks.length) throw new Error('unexpected end of file');
+            },
+            finish() {
+                if (i < toks.length) throw new Error('PLY: extra data after the last element (element counts in the header may be wrong)');
+            },
+        };
     }
 
-    // const name = path.basename(filename);
-    let ply_data_object = {}
-    ply_data_object.vertices = vertices
-    ply_data_object.faces = faces
-    ply_data_object.colors = colors
+    function binaryReader(bytes, off, le) {
+        const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const len = bytes.byteLength;
+        return {
+            num(type) {
+                if (off + type.size > len) throw new Error('unexpected end of file');
+                const v = dv[type.get](off, le);
+                off += type.size;
+                return v;
+            },
+            skip(type, count) {
+                if ((off += count * type.size) > len) throw new Error('unexpected end of file');
+            },
+            finish() {},
+        };
+    }
 
-    return ply_data_object;
-}
+    function readBody(h, r) {
+        const n = h.vertexEl.count;
+        const vertices = [], normals = [], colors = [], faces = [];
+        // Destination [array, component] for each vertex property, or null to discard it.
+        const slots = h.vertexEl.props.map((p) => {
+            if (p.list) return null;
+            for (const [arr, names] of [[vertices, ['x', 'y', 'z']], [normals, h.normalNames], [colors, h.colorNames]]) {
+                const c = names ? names.indexOf(p.name) : -1;
+                if (c >= 0) return [arr, c];
+            }
+            return null;
+        });
 
-if (typeof module !== 'undefined' && typeof module.exports !== 'undefined') {
-    module.exports = parsePlyData;
-}
+        let el, e = 0;
+        try {
+            for (el of h.elements) {
+                const isVertex = el === h.vertexEl, props = el.props;
+                if (isVertex) {
+                    for (let i = 0; i < n; i++) {
+                        vertices.push([0, 0, 0]);
+                        if (h.normalNames) normals.push([0, 0, 0]);
+                        if (h.colorNames) colors.push([0, 0, 0]);
+                    }
+                }
+                for (e = 0; e < el.count; e++) {
+                    for (let k = 0; k < props.length; k++) {
+                        const p = props[k];
+                        if (!p.list) {
+                            const v = r.num(p.type), s = isVertex && slots[k];
+                            if (s) s[0][e][s[1]] = v;
+                            continue;
+                        }
+                        const count = r.num(p.countType);
+                        if (!Number.isInteger(count) || count < 0) throw new Error(`invalid list length ${count}`);
+                        if (p !== h.faceList) { r.skip(p.itemType, count); continue; }
+                        const face = new Array(count);
+                        for (let i = 0; i < count; i++) {
+                            const v = (face[i] = r.num(p.itemType));
+                            if (!(v >= 0 && v < n && Number.isInteger(v))) {
+                                throw new Error(`vertex index ${v} out of range (only ${n} vertices)`);
+                            }
+                        }
+                        faces.push(face);
+                    }
+                }
+            }
+        } catch (err) {
+            throw new Error(`PLY: ${err.message} in ${el.name} ${e}`);
+        }
+        r.finish();
+
+        const bad = vertices.findIndex((v) => !v.every(Number.isFinite));
+        if (bad >= 0) throw new Error(`PLY: vertex ${bad} has a non-finite coordinate`);
+
+        return {vertices, faces, colors, normals};
+    }
+
+    if (typeof module !== 'undefined' && typeof module.exports !== 'undefined') {
+        module.exports = parsePlyData;
+    } else {
+        globalThis.parsePlyData = parsePlyData;
+    }
+})();
